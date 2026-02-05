@@ -43,30 +43,11 @@ async function uploadFolder(bucket, prefix, folderPath) {
   }
 }
 
-async function markFailed(job, err) {
-  const msg = String(err?.message || err || "unknown error");
-  await supabase
-    .from("video_transcode_jobs")
-    .update({
-      status: "failed",
-      last_error: msg,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", job.id);
-}
-
 async function processJob(job) {
   const { id, post_id, source_path } = job;
 
-  // cria URL assinada do MP4
-  const { data: signed, error: signErr } = await supabase
-    .storage
-    .from("videos")
-    .createSignedUrl(source_path, 60 * 60);
-
-  if (signErr || !signed?.signedUrl) {
-    throw new Error(`Signed URL error: ${signErr?.message || "no url"}`);
-  }
+  // usa URL pública direta (bucket videos é público)
+  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/videos/${source_path}`;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-"));
   const outDir = path.join(tmpDir, "hls");
@@ -81,7 +62,7 @@ async function processJob(job) {
       "-reconnect", "1",
       "-reconnect_streamed", "1",
       "-reconnect_delay_max", "5",
-      "-i", signed.signedUrl,
+      "-i", publicUrl,
       "-preset", "veryfast",
       "-g", "48",
       "-sc_threshold", "0",
