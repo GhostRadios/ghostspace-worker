@@ -4,6 +4,9 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import dns from "node:dns";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -33,12 +36,17 @@ async function uploadFolder(bucket, prefix, folderPath) {
       await uploadFolder(bucket, `${prefix}/${file}`, full);
     } else {
       const content = fs.readFileSync(full);
-      await supabase.storage.from(bucket).upload(`${prefix}/${file}`, content, {
-        contentType: file.endsWith(".m3u8")
-          ? "application/vnd.apple.mpegurl"
-          : "video/MP2T",
-        upsert: true,
-      });
+      const { error } = await supabase.storage.from(bucket).upload(
+        `${prefix}/${file}`,
+        content,
+        {
+          contentType: file.endsWith(".m3u8")
+            ? "application/vnd.apple.mpegurl"
+            : "video/MP2T",
+          upsert: true,
+        }
+      );
+      if (error) throw error;
     }
   }
 }
@@ -46,8 +54,8 @@ async function uploadFolder(bucket, prefix, folderPath) {
 async function processJob(job) {
   const { id, post_id, source_path } = job;
 
-  // usa URL pública direta (bucket videos é público)
   const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/videos/${source_path}`;
+  console.log(`[JOB] Public URL: ${publicUrl}`);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-"));
   const outDir = path.join(tmpDir, "hls");
