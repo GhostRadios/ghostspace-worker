@@ -1,0 +1,14 @@
+{
+  "name": "ghostspace-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.48.1",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
+}
