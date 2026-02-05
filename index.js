@@ -5,8 +5,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import dns from "node:dns";
+import { Agent, setGlobalDispatcher } from "undici";
 
 dns.setDefaultResultOrder("ipv4first");
+setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
 
 const app = express();
 const PORT = process.env.PORT || 8080;
