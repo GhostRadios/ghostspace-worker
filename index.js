@@ -6,6 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import dns from "node:dns";
 import fetch, { Headers, Request, Response } from "node-fetch";
+import { pipeline } from "node:stream/promises";
 
 dns.setDefaultResultOrder("ipv4first");
 
@@ -54,6 +55,14 @@ async function withRetry(fn, attempts = 3, delayMs = 2000) {
   throw lastErr;
 }
 
+async function downloadToFile(url, filePath) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  }
+  await pipeline(res.body, fs.createWriteStream(filePath));
+}
+
 async function uploadFolder(bucket, prefix, folderPath) {
   const files = fs.readdirSync(folderPath);
   for (const file of files) {
@@ -84,23 +93,27 @@ async function uploadFolder(bucket, prefix, folderPath) {
 async function processJob(job) {
   const { id, post_id, source_path } = job;
 
-  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/videos/${source_path}`;
-  console.log(`[JOB] Public URL: ${publicUrl}`);
+  const { data: signed, error: signErr } = await supabase.storage
+    .from("videos")
+    .createSignedUrl(source_path, 60 * 60);
+
+  if (signErr) throw signErr;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-"));
+  const inputFile = path.join(tmpDir, "input.mp4");
   const outDir = path.join(tmpDir, "hls");
   fs.mkdirSync(outDir, { recursive: true });
 
   const hlsPath = `${post_id}/${id}`;
 
+  console.log(`[JOB] Downloading ${source_path}`);
+  await downloadToFile(signed.signedUrl, inputFile);
+
   console.log(`[JOB] Transcoding ${source_path} -> ${hlsPath}`);
   await new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", [
       "-y",
-      "-reconnect", "1",
-      "-reconnect_streamed", "1",
-      "-reconnect_delay_max", "5",
-      "-i", publicUrl,
+      "-i", inputFile,
       "-preset", "veryfast",
       "-g", "48",
       "-sc_threshold", "0",
@@ -135,6 +148,8 @@ async function processJob(job) {
       .eq("id", id);
     if (error) throw error;
   });
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 }
 
 async function poll() {
