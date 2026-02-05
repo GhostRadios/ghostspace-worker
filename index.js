@@ -13,12 +13,21 @@ setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// aceita ambos: SUPABASE_* e APP_*
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || process.env.APP_SUPABASE_URL;
+
+const SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.APP_SERVICE_ROLE_KEY;
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  process.exit(1);
+  console.error(
+    "Missing SUPABASE_URL/APP_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY/APP_SERVICE_ROLE_KEY"
+  );
+  // NÃO derruba o container, só loga
+} else {
+  console.log("Supabase envs OK");
 }
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
