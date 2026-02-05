@@ -24,13 +24,6 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "ghostspace-worker" });
 });
 
-async function downloadFile(bucket, filePath, destPath) {
-  const { data, error } = await supabase.storage.from(bucket).download(filePath);
-  if (error) throw error;
-  const arrayBuffer = await data.arrayBuffer();
-  fs.writeFileSync(destPath, Buffer.from(arrayBuffer));
-}
-
 async function uploadFolder(bucket, prefix, folderPath) {
   const files = fs.readdirSync(folderPath);
   for (const file of files) {
@@ -50,26 +43,45 @@ async function uploadFolder(bucket, prefix, folderPath) {
   }
 }
 
+async function markFailed(job, err) {
+  const msg = String(err?.message || err || "unknown error");
+  await supabase
+    .from("video_transcode_jobs")
+    .update({
+      status: "failed",
+      last_error: msg,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", job.id);
+}
+
 async function processJob(job) {
   const { id, post_id, source_path } = job;
 
+  // cria URL assinada do MP4
+  const { data: signed, error: signErr } = await supabase
+    .storage
+    .from("videos")
+    .createSignedUrl(source_path, 60 * 60);
+
+  if (signErr || !signed?.signedUrl) {
+    throw new Error(`Signed URL error: ${signErr?.message || "no url"}`);
+  }
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-"));
-  const inputPath = path.join(tmpDir, "input.mp4");
   const outDir = path.join(tmpDir, "hls");
-
   fs.mkdirSync(outDir, { recursive: true });
-
-  console.log(`[JOB] Downloading ${source_path}`);
-  await downloadFile("videos", source_path, inputPath);
 
   const hlsPath = `${post_id}/${id}`;
 
-  console.log(`[JOB] Transcoding to HLS ${hlsPath}`);
+  console.log(`[JOB] Transcoding ${source_path} -> ${hlsPath}`);
   await new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", [
       "-y",
-      "-i",
-      inputPath,
+      "-reconnect", "1",
+      "-reconnect_streamed", "1",
+      "-reconnect_delay_max", "5",
+      "-i", signed.signedUrl,
       "-preset", "veryfast",
       "-g", "48",
       "-sc_threshold", "0",
@@ -89,15 +101,11 @@ async function processJob(job) {
   console.log(`[JOB] Uploading HLS to videos-hls/${hlsPath}`);
   await uploadFolder("videos-hls", hlsPath, outDir);
 
-  // Atualiza posts (tabela técnica) com hls_path
-  const { error } = await supabase
+  await supabase
     .from("posts")
     .update({ hls_path: `${hlsPath}/index.m3u8` })
     .eq("id", post_id);
 
-  if (error) throw error;
-
-  // Marca job como completed
   await supabase
     .from("video_transcode_jobs")
     .update({ status: "completed", updated_at: new Date().toISOString() })
@@ -114,19 +122,15 @@ async function poll() {
       .limit(1);
 
     if (error) throw error;
-
-    if (!jobs || jobs.length === 0) {
-      return;
-    }
+    if (!jobs || jobs.length === 0) return;
 
     const job = jobs[0];
 
-    // marca como processing
     await supabase
       .from("video_transcode_jobs")
       .update({
         status: "processing",
-        locked_by: "ghostspace-worker",
+        locked_by: "ghostspace-worker-new",
         locked_at: new Date().toISOString(),
       })
       .eq("id", job.id);
