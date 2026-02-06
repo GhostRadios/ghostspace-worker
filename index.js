@@ -6,8 +6,9 @@ import path from "node:path";
 import os from "node:os";
 import dns from "node:dns";
 import { Agent, setGlobalDispatcher } from "undici";
-import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
 
 dns.setDefaultResultOrder("ipv4first");
 setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
@@ -15,8 +16,9 @@ setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const WORKER_NAME = process.env.WORKER_NAME || "ghostspace-worker-new";
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
@@ -27,53 +29,81 @@ const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-const BUCKET_SOURCE = "videos";
-const BUCKET_HLS = "videos-hls";
-const WORKER_ID = "ghostspace-worker-new";
-
-let isWorking = false;
+const STORAGE_PUBLIC_BASE = `${SUPABASE_URL}/storage/v1/object/public/videos`;
 
 app.get("/", (_req, res) => {
   res.json({ ok: true, service: "ghostspace-worker" });
 });
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+app.get("/probe", async (req, res) => {
+  try {
+    const sourcePath = String(req.query.path || "");
+    if (!sourcePath || sourcePath.includes("..")) {
+      return res.status(400).json({ error: "invalid path" });
+    }
 
-async function signedUrl(bucket, objectPath, expiresInSec = 3600) {
-  const { data, error } = await supabase.storage
-    .from(bucket)
-    .createSignedUrl(objectPath, expiresInSec);
-  if (error || !data?.signedUrl) {
-    throw new Error(`signed url error: ${error?.message || "unknown"}`);
+    const url = `${STORAGE_PUBLIC_BASE}/${sourcePath}`;
+    const r = await fetchWithTimeout(
+      url,
+      { method: "HEAD", headers: { "User-Agent": "ghostspace-worker" } },
+      20000
+    );
+
+    const headers = {};
+    r.headers.forEach((v, k) => (headers[k] = v));
+
+    res.json({ url, status: r.status, headers });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
   }
-  return data.signedUrl;
+});
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 60000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
 }
 
-async function downloadToFile(url, destPath, retries = 3) {
-  let lastErr;
-  for (let attempt = 1; attempt <= retries; attempt += 1) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(
-          `http ${res.status} ${res.statusText} ${text.slice(0, 200)}`
-        );
-      }
-      if (!res.body) throw new Error("empty response body");
+async function downloadWithRetry(sourcePath, destPath, attempts = 3) {
+  const url = `${STORAGE_PUBLIC_BASE}/${sourcePath}`;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const res = await fetchWithTimeout(
+      url,
+      { headers: { "User-Agent": "ghostspace-worker", Accept: "*/*" } },
+      90000
+    );
+
+    if (res.ok && res.body) {
       await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(destPath));
       return;
-    } catch (err) {
-      lastErr = err;
-      console.warn(
-        `[DL] attempt ${attempt}/${retries} failed: ${err?.message || err}`
-      );
-      await sleep(1000 * attempt);
     }
+
+    const text = await safeReadText(res);
+    console.error(
+      `[DOWNLOAD] attempt ${attempt} failed: HTTP ${res.status} ${text}`
+    );
+
+    if (attempt === attempts) {
+      throw new Error(`HTTP ${res.status} ${text}`);
+    }
+
+    await sleep(1500 * attempt);
   }
-  throw lastErr;
+}
+
+async function safeReadText(res) {
+  try {
+    const txt = await res.text();
+    return (txt || "").slice(0, 300);
+  } catch {
+    return "";
+  }
 }
 
 async function uploadFolder(bucket, prefix, folderPath) {
@@ -81,109 +111,112 @@ async function uploadFolder(bucket, prefix, folderPath) {
   for (const file of files) {
     const full = path.join(folderPath, file);
     const stat = fs.statSync(full);
+
     if (stat.isDirectory()) {
       await uploadFolder(bucket, `${prefix}/${file}`, full);
-    } else {
-      const content = fs.readFileSync(full);
-      const { error } = await supabase.storage
-        .from(bucket)
-        .upload(`${prefix}/${file}`, content, {
-          contentType: file.endsWith(".m3u8")
-            ? "application/vnd.apple.mpegurl"
-            : "video/MP2T",
-          upsert: true,
-        });
-      if (error) throw error;
+      continue;
     }
+
+    const content = fs.readFileSync(full);
+    const { error } = await supabase.storage
+      .from(bucket)
+      .upload(`${prefix}/${file}`, content, {
+        contentType: file.endsWith(".m3u8")
+          ? "application/vnd.apple.mpegurl"
+          : "video/MP2T",
+        upsert: true,
+      });
+
+    if (error) throw error;
   }
 }
 
-async function transcodeToHls(inputFile, outDir) {
-  await new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", [
-      "-y",
-      "-i",
-      inputFile,
-      "-preset",
-      "veryfast",
-      "-g",
-      "48",
-      "-sc_threshold",
-      "0",
-      "-hls_time",
-      "2",
-      "-hls_playlist_type",
-      "vod",
-      "-hls_segment_filename",
-      path.join(outDir, "segment_%03d.ts"),
-      path.join(outDir, "index.m3u8"),
-    ]);
+async function failJob(id, message) {
+  const msg = (message || "unknown").slice(0, 500);
 
-    ff.stderr.on("data", (d) => console.log(d.toString()));
-    ff.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg failed with code ${code}`));
-    });
-  });
+  await supabase
+    .from("video_transcode_jobs")
+    .update({
+      status: "failed",
+      last_error: msg,
+      error_message: msg,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
 }
 
 async function processJob(job) {
   const { id, post_id, source_path } = job;
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-"));
-  const outDir = path.join(tmpDir, "hls");
   const sourceFile = path.join(tmpDir, "source.mp4");
+  const outDir = path.join(tmpDir, "hls");
   fs.mkdirSync(outDir, { recursive: true });
 
+  const hlsPrefix = `${post_id}/${id}`;
+  const hlsIndex = `${hlsPrefix}/index.m3u8`;
+  const hlsPublicUrl = `${SUPABASE_URL}/storage/v1/object/public/videos-hls/${hlsIndex}`;
+
   try {
-    const url = await signedUrl(BUCKET_SOURCE, source_path);
-    console.log(`[JOB] Signed URL: ${url}`);
-
     console.log(`[JOB] Downloading ${source_path}`);
-    await downloadToFile(url, sourceFile);
+    await downloadWithRetry(source_path, sourceFile);
 
-    const hlsPrefix = `${post_id}/${id}`;
     console.log(`[JOB] Transcoding ${source_path} -> ${hlsPrefix}`);
-    await transcodeToHls(sourceFile, outDir);
+    await new Promise((resolve, reject) => {
+      const ff = spawn("ffmpeg", [
+        "-y",
+        "-i",
+        sourceFile,
+        "-preset",
+        "veryfast",
+        "-g",
+        "48",
+        "-sc_threshold",
+        "0",
+        "-hls_time",
+        "2",
+        "-hls_playlist_type",
+        "vod",
+        "-hls_segment_filename",
+        path.join(outDir, "segment_%03d.ts"),
+        path.join(outDir, "index.m3u8"),
+      ]);
 
-    console.log(`[JOB] Uploading HLS to ${BUCKET_HLS}/${hlsPrefix}`);
-    await uploadFolder(BUCKET_HLS, hlsPrefix, outDir);
+      ff.stderr.on("data", (d) => console.log(d.toString()));
+      ff.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg failed with code ${code}`));
+      });
+    });
 
-    const hlsPath = `${hlsPrefix}/index.m3u8`;
-    const hlsPublicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET_HLS}/${hlsPath}`;
+    console.log(`[JOB] Uploading HLS to videos-hls/${hlsPrefix}`);
+    await uploadFolder("videos-hls", hlsPrefix, outDir);
 
-    await Promise.all([
-      supabase.from("posts").update({ hls_path: hlsPath, media_url: hlsPublicUrl }).eq("id", post_id),
-      supabase.from("gs_posts").update({ hls_path: hlsPath, media_url: hlsPublicUrl }).eq("id", post_id),
-    ]);
+    await supabase.from("posts").update({ hls_path: hlsIndex }).eq("id", post_id);
+
+    await supabase
+      .from("gs_posts")
+      .update({ hls_path: hlsIndex, media_url: hlsPublicUrl })
+      .eq("id", post_id);
 
     await supabase
       .from("video_transcode_jobs")
-      .update({
-        status: "completed",
-        last_error: null,
-        updated_at: new Date().toISOString(),
-      })
+      .update({ status: "completed", updated_at: new Date().toISOString() })
       .eq("id", id);
   } catch (err) {
-    const msg = err?.message || String(err);
-    console.error("Worker error:", msg);
-    await supabase
-      .from("video_transcode_jobs")
-      .update({
-        status: "failed",
-        last_error: msg.slice(0, 500),
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", id);
+    console.error("Worker error:", err);
+    await failJob(id, String(err));
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
-async function poll() {
-  if (isWorking) return;
-  isWorking = true;
+let busy = false;
 
+async function poll() {
+  if (busy) return;
+
+  busy = true;
   try {
     const { data: jobs, error } = await supabase
       .from("video_transcode_jobs")
@@ -196,25 +229,21 @@ async function poll() {
     if (!jobs || jobs.length === 0) return;
 
     const job = jobs[0];
-    const now = new Date().toISOString();
-    const lease = new Date(Date.now() + 30 * 60 * 1000).toISOString();
 
     await supabase
       .from("video_transcode_jobs")
       .update({
         status: "processing",
-        locked_by: WORKER_ID,
-        locked_at: now,
-        lease_expires_at: lease,
+        locked_by: WORKER_NAME,
+        locked_at: new Date().toISOString(),
       })
-      .eq("id", job.id)
-      .eq("status", "pending");
+      .eq("id", job.id);
 
     await processJob(job);
   } catch (err) {
-    console.error("Poll error:", err?.message || err);
+    console.error("Worker error:", err);
   } finally {
-    isWorking = false;
+    busy = false;
   }
 }
 
