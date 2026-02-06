@@ -1,121 +1,99 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { spawn } from "node:child_process";
-import fs from "node:fs";
+import { createWriteStream, promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import dns from "node:dns";
-import fetch, { Headers, Request, Response } from "node-fetch";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 dns.setDefaultResultOrder("ipv4first");
 
-// força supabase-js a usar node-fetch
-globalThis.fetch = fetch;
-globalThis.Headers = Headers;
-globalThis.Request = Request;
-globalThis.Response = Response;
-
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// aceita ambos: SUPABASE_* e APP_*
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || process.env.APP_SUPABASE_URL;
-
-const SERVICE_ROLE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.APP_SERVICE_ROLE_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
-  console.error(
-    "Missing SUPABASE_URL/APP_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY/APP_SERVICE_ROLE_KEY"
-  );
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
-  global: { fetch },
 });
+
+const SRC_BUCKET = "videos";
+const HLS_BUCKET = "videos-hls";
+const WORKER_ID = "ghostspace-worker-new";
+const POLL_MS = 5000;
+const MAX_DOWNLOAD_RETRIES = 3;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const nowIso = () => new Date().toISOString();
 
 app.get("/", (_req, res) => {
   res.json({ ok: true, service: "ghostspace-worker" });
 });
 
-async function withRetry(fn, attempts = 3, delayMs = 2000) {
-  let lastErr;
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-async function downloadToFile(url, filePath) {
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-  }
-  await pipeline(res.body, fs.createWriteStream(filePath));
-}
-
 async function uploadFolder(bucket, prefix, folderPath) {
-  const files = fs.readdirSync(folderPath);
-  for (const file of files) {
-    const full = path.join(folderPath, file);
-    const stat = fs.statSync(full);
-    if (stat.isDirectory()) {
-      await uploadFolder(bucket, `${prefix}/${file}`, full);
-    } else {
-      const content = fs.readFileSync(full);
+  const entries = await fsp.readdir(folderPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(folderPath, entry.name);
+    if (entry.isDirectory()) {
+      await uploadFolder(bucket, `${prefix}/${entry.name}`, full);
+      continue;
+    }
+    const content = await fsp.readFile(full);
+    const contentType = entry.name.endsWith(".m3u8")
+      ? "application/vnd.apple.mpegurl"
+      : "video/MP2T";
 
-      await withRetry(async () => {
-        const { error } = await supabase.storage.from(bucket).upload(
-          `${prefix}/${file}`,
-          content,
-          {
-            contentType: file.endsWith(".m3u8")
-              ? "application/vnd.apple.mpegurl"
-              : "video/MP2T",
-            upsert: true,
-          }
-        );
-        if (error) throw error;
+    const { error } = await supabase.storage
+      .from(bucket)
+      .upload(`${prefix}/${entry.name}`, content, {
+        contentType,
+        upsert: true,
       });
+
+    if (error) throw error;
+  }
+}
+
+async function downloadWithRetry(url, destPath) {
+  for (let attempt = 1; attempt <= MAX_DOWNLOAD_RETRIES; attempt++) {
+    try {
+      const res = await fetch(url, { redirect: "follow" });
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(destPath));
+      return;
+    } catch (err) {
+      if (attempt === MAX_DOWNLOAD_RETRIES) throw err;
+      console.log(`[JOB] Download failed (attempt ${attempt}). Retrying...`);
+      await sleep(2000 * attempt);
     }
   }
 }
 
-async function processJob(job) {
-  const { id, post_id, source_path } = job;
-
-  const { data: signed, error: signErr } = await supabase.storage
-    .from("videos")
-    .createSignedUrl(source_path, 60 * 60);
-
-  if (signErr) throw signErr;
-
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gs-"));
-  const inputFile = path.join(tmpDir, "input.mp4");
-  const outDir = path.join(tmpDir, "hls");
-  fs.mkdirSync(outDir, { recursive: true });
-
-  const hlsPath = `${post_id}/${id}`;
-
-  console.log(`[JOB] Downloading ${source_path}`);
-  await downloadToFile(signed.signedUrl, inputFile);
-
-  console.log(`[JOB] Transcoding ${source_path} -> ${hlsPath}`);
+async function transcodeToHls(inputFile, outDir) {
   await new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", [
       "-y",
       "-i", inputFile,
+      "-c:v", "libx264",
       "-preset", "veryfast",
+      "-profile:v", "main",
+      "-level", "3.1",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-ac", "2",
+      "-ar", "48000",
       "-g", "48",
+      "-keyint_min", "48",
       "-sc_threshold", "0",
       "-hls_time", "2",
       "-hls_playlist_type", "vod",
@@ -129,27 +107,76 @@ async function processJob(job) {
       else reject(new Error(`ffmpeg failed with code ${code}`));
     });
   });
+}
 
-  console.log(`[JOB] Uploading HLS to videos-hls/${hlsPath}`);
-  await uploadFolder("videos-hls", hlsPath, outDir);
+async function processJob(job) {
+  const { id, post_id, source_path, attempts = 0 } = job;
 
-  await withRetry(async () => {
-    const { error } = await supabase
-      .from("posts")
-      .update({ hls_path: `${hlsPath}/index.m3u8` })
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gs-"));
+  const inFile = path.join(tmpDir, "source.mp4");
+  const outDir = path.join(tmpDir, "hls");
+
+  try {
+    await fsp.mkdir(outDir, { recursive: true });
+
+    const { data: signed, error: signedErr } = await supabase.storage
+      .from(SRC_BUCKET)
+      .createSignedUrl(source_path, 3600);
+
+    const downloadUrl =
+      signed?.signedUrl ||
+      `${SUPABASE_URL}/storage/v1/object/public/${SRC_BUCKET}/${source_path}`;
+
+    if (signedErr) {
+      console.log("[JOB] Signed URL error, using public URL fallback.");
+    }
+
+    console.log(`[JOB] Downloading ${source_path}`);
+    await downloadWithRetry(downloadUrl, inFile);
+
+    const hlsPath = `${post_id}/${id}`;
+    console.log(`[JOB] Transcoding ${source_path} -> ${hlsPath}`);
+    await transcodeToHls(inFile, outDir);
+
+    console.log(`[JOB] Uploading HLS to ${HLS_BUCKET}/${hlsPath}`);
+    await uploadFolder(HLS_BUCKET, hlsPath, outDir);
+
+    const hlsPublicUrl = `${SUPABASE_URL}/storage/v1/object/public/${HLS_BUCKET}/${hlsPath}/index.m3u8`;
+
+    await supabase
+      .from("gs_posts")
+      .update({
+        hls_path: `${hlsPath}/index.m3u8`,
+        media_url: hlsPublicUrl,
+      })
       .eq("id", post_id);
-    if (error) throw error;
-  });
 
-  await withRetry(async () => {
-    const { error } = await supabase
+    await supabase
       .from("video_transcode_jobs")
-      .update({ status: "completed", updated_at: new Date().toISOString() })
+      .update({
+        status: "completed",
+        updated_at: nowIso(),
+        last_error: null,
+        error_message: null,
+      })
       .eq("id", id);
-    if (error) throw error;
-  });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await supabase
+      .from("video_transcode_jobs")
+      .update({
+        status: "failed",
+        updated_at: nowIso(),
+        last_error: message.slice(0, 500),
+        error_message: message.slice(0, 1000),
+        attempts: attempts + 1,
+      })
+      .eq("id", id);
 
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.error("Worker error:", err);
+  } finally {
+    await fsp.rm(tmpDir, { recursive: true, force: true });
+  }
 }
 
 async function poll() {
@@ -166,22 +193,27 @@ async function poll() {
 
     const job = jobs[0];
 
-    await supabase
+    const { data: claimed, error: claimError } = await supabase
       .from("video_transcode_jobs")
       .update({
         status: "processing",
-        locked_by: "ghostspace-worker-new",
-        locked_at: new Date().toISOString(),
+        locked_by: WORKER_ID,
+        locked_at: nowIso(),
       })
-      .eq("id", job.id);
+      .eq("id", job.id)
+      .eq("status", "pending")
+      .select();
 
-    await processJob(job);
+    if (claimError) throw claimError;
+    if (!claimed || claimed.length === 0) return;
+
+    await processJob(claimed[0]);
   } catch (err) {
     console.error("Worker error:", err);
   }
 }
 
-setInterval(poll, 5000);
+setInterval(poll, POLL_MS);
 
 app.listen(PORT, () => {
   console.log(`Worker listening on ${PORT}`);
